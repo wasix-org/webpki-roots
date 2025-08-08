@@ -1,18 +1,18 @@
-use std::ascii::escape_default;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
-use std::fmt::Write;
-use std::fs;
+use std::ops::Add;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use num_bigint::BigUint;
-use ring::digest;
+use pki_types::pem::PemObject;
+use pki_types::CertificateDer;
 use serde::Deserialize;
-use x509_parser::prelude::AttributeTypeAndValue;
-use x509_parser::x509::X509Name;
 
-#[tokio::test]
-async fn new_generated_code_is_fresh() {
+// Fetch root certificate data from the CCADB server.
+//
+// Returns an ordered BTreeMap of the root certificates, keyed by the SHA256 fingerprint of the
+// certificate. Panics if there are any duplicate fingerprints.
+pub async fn fetch_ccadb_roots() -> BTreeMap<String, CertificateMetadata> {
     // Configure a Reqwest client that only trusts the CA certificate expected to be the
     // root of trust for the CCADB server.
     //
@@ -26,18 +26,18 @@ async fn new_generated_code_is_fresh() {
     //  4. Clicking "Certificate is valid"
     //  5. Clicking the "Details" tab.
     //  6. Selecting the topmost "System Trust" entry.
-    //  7. Clicking "Export..." and saving the certificate to `webpki-roots/tests/data/`.
+    //  7. Clicking "Export..." and saving the certificate to `webpki-roots/webpki-ccadb/src/data/`.
     //  8. Committing the updated .pem root CA, and updating the `include_bytes!` path.
     let root = include_bytes!("data/DigiCertGlobalRootCA.pem");
     let root = reqwest::Certificate::from_pem(root).unwrap();
     let client = reqwest::Client::builder()
-        .user_agent(format!("webpki-roots/v{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("webpki-ccadb/v{}", env!("CARGO_PKG_VERSION")))
         .add_root_certificate(root)
         .build()
         .unwrap();
 
     let ccadb_url =
-        "https://ccadb-public.secure.force.com/mozilla/IncludedCACertificateReportPEMCSV";
+        "https://ccadb.my.salesforce-sites.com/mozilla/IncludedCACertificateReportPEMCSV";
     eprintln!("fetching {ccadb_url}...");
 
     let req = client.get(ccadb_url).build().unwrap();
@@ -57,10 +57,10 @@ async fn new_generated_code_is_fresh() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    // Filter for just roots with the TLS trust bit that are not distrusted as of today's date.
+    // Filter for just roots we trust for TLS.
     let trusted_tls_roots = metadata
         .into_iter()
-        .filter(|root| root.trusted_for_tls(&Utc::now().naive_utc().date()))
+        .filter(CertificateMetadata::trusted_for_tls)
         .collect::<Vec<CertificateMetadata>>();
 
     // Create an ordered BTreeMap of the roots, panicking for any duplicates.
@@ -76,122 +76,7 @@ async fn new_generated_code_is_fresh() {
         }
     }
 
-    let mut code = String::with_capacity(256 * 1_024);
-    code.push_str(HEADER);
-    code.push_str("pub const TLS_SERVER_ROOTS: &[TrustAnchor] = &[\n");
-    let (mut subject, mut spki, mut name_constraints) =
-        (String::new(), String::new(), String::new());
-
-    for (_, root) in tls_roots_map {
-        // Verify the DER FP matches the metadata FP.
-        let der = root.der();
-        let calculated_fp = digest::digest(&digest::SHA256, &der);
-        let metadata_fp = hex::decode(&root.sha256_fingerprint).expect("malformed fingerprint");
-        assert_eq!(calculated_fp.as_ref(), metadata_fp.as_slice());
-
-        let ta = webpki::TrustAnchor::try_from_cert_der(&der).expect("malformed trust anchor der");
-        subject.clear();
-        for &b in ta.subject {
-            write!(&mut subject, "{}", escape_default(b)).unwrap();
-        }
-
-        spki.clear();
-        for &b in ta.spki {
-            write!(&mut spki, "{}", escape_default(b)).unwrap();
-        }
-
-        name_constraints.clear();
-        if let Some(nc) = &root.mozilla_applied_constraints() {
-            for &b in nc.iter() {
-                write!(&mut name_constraints, "{}", escape_default(b)).unwrap();
-            }
-        }
-
-        let (_, parsed_cert) =
-            x509_parser::parse_x509_certificate(&der).expect("malformed x509 der");
-        let issuer = name_to_string(parsed_cert.issuer());
-        let subject_str = name_to_string(parsed_cert.subject());
-        let label = root.common_name_or_certificate_name.clone();
-        let serial = root.serial().to_string();
-        let sha256_fp = root.sha256_fp();
-
-        // Write comment
-        code.push_str("  /*\n");
-        code.push_str(&format!("   * Issuer: {}\n", issuer));
-        code.push_str(&format!("   * Subject: {}\n", subject_str));
-        code.push_str(&format!("   * Label: {:?}\n", label));
-        code.push_str(&format!("   * Serial: {}\n", serial));
-        code.push_str(&format!("   * SHA256 Fingerprint: {}\n", sha256_fp));
-        for ln in root.pem().lines() {
-            code.push_str("   * ");
-            code.push_str(ln.trim());
-            code.push('\n');
-        }
-        code.push_str("   */\n");
-
-        // Write the code
-        code.push_str("  TrustAnchor {\n");
-        code.write_fmt(format_args!("    subject: b\"{subject}\",\n"))
-            .unwrap();
-        code.write_fmt(format_args!("    spki: b\"{spki}\",\n"))
-            .unwrap();
-        match name_constraints.is_empty() {
-            false => code
-                .write_fmt(format_args!(
-                    "    name_constraints: Some(b\"{name_constraints}\")\n"
-                ))
-                .unwrap(),
-            true => code.push_str("    name_constraints: None\n"),
-        }
-        code.push_str("  },\n\n");
-    }
-    code.push_str("];\n");
-
-    // Check that the generated code matches the checked-in code
-    let old = fs::read_to_string("src/lib.rs").unwrap();
-    if old != code {
-        fs::write("src/lib.rs", code).unwrap();
-        panic!("generated code changed");
-    }
-}
-
-/// The built-in x509_parser::X509Name Display impl uses a different sort order than
-/// the one historically used by mkcert.org^[0]. We re-create that sort order here to
-/// avoid unnecessary churn in the generated code.
-///
-/// [0]: <https://github.com/Lukasa/mkcert/blob/6911a8f68681f4d6a795c1f6db7b063f75b03b5a/certs/convert_mozilla_certdata.go#L405-L428>
-fn name_to_string(name: &X509Name) -> String {
-    let mut ret = String::with_capacity(256);
-
-    if let Some(cn) = name
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-    {
-        write!(ret, "CN={}", cn).unwrap();
-    }
-
-    let mut append_attrs = |attrs: Vec<&AttributeTypeAndValue>, label| {
-        let str_parts = attrs
-            .iter()
-            .filter_map(|attr| match attr.as_str() {
-                Ok(s) => Some(s),
-                Err(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
-        if !str_parts.is_empty() {
-            if !ret.is_empty() {
-                ret.push(' ');
-            }
-            write!(ret, "{}={}", label, str_parts).unwrap();
-        }
-    };
-
-    append_attrs(name.iter_organization().collect(), "O");
-    append_attrs(name.iter_organizational_unit().collect(), "OU");
-
-    ret
+    tls_roots_map
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Deserialize)]
@@ -219,11 +104,26 @@ pub struct CertificateMetadata {
 }
 
 impl CertificateMetadata {
-    /// Returns true iff the certificate has valid TrustBits that include TrustBits::Websites,
-    /// and the certificate has no distrust for TLS after date, or has a valid distrust
-    /// for TLS after date that is in the future compared to `now`. In all other cases this function
-    /// returns false.
-    fn trusted_for_tls(&self, now: &NaiveDate) -> bool {
+    /// Returns true if-and-only-if the issuer certificate should be considered trusted to issue TLS
+    /// certificates.
+    ///
+    /// In practice this means it must have valid TrustBits that include TrustBits::Websites,
+    /// and if the certificate has a distrust for TLS after date, that it's in the past or
+    /// within a 398-day grace period, and that the fingerprint isn't in the EXCLUDED_FINGERPRINTS
+    /// list.
+    ///
+    /// This grace period allows extant certificates issued before the distrust date to
+    /// remain valid for their lifetime. At the time of writing the CA/B forum baseline
+    /// reqs[0] peg this to 398 days (§ 6.3.2).
+    ///
+    /// [0]: <https://cabforum.org/working-groups/server/baseline-requirements/documents/CA-Browser-Forum-TLS-BR-2.0.9.pdf>
+    fn trusted_for_tls(&self) -> bool {
+        // If the fingerprint is in the excluded list, it's not trusted based on policy
+        // we're imposing ourselves.
+        if EXCLUDED_FINGERPRINTS.contains(&self.sha256_fingerprint.as_str()) {
+            return false;
+        }
+
         let has_tls_trust_bit = self.trust_bits().contains(&TrustBits::Websites);
 
         match (has_tls_trust_bit, self.tls_distrust_after()) {
@@ -231,21 +131,16 @@ impl CertificateMetadata {
             (false, _) => false,
             // Has website trust bit, no distrust after - trusted for tls.
             (true, None) => true,
-            // Trust bit, populated distrust after - need to check date to decide.
-            (true, Some(tls_distrust_after)) => {
-                match now.cmp(&tls_distrust_after).is_ge() {
-                    // We're past the distrust date - skip.
-                    true => false,
-                    // We haven't yet reached the distrust date - include.
-                    false => true,
-                }
+            // Trust bit, populated distrust after - check if we're within the grace period.
+            (true, Some(distrust_after)) => {
+                Utc::now().naive_utc() < distrust_after.add(Duration::days(398)).into()
             }
         }
     }
 
     /// Return the Mozilla applied constraints for the certificate (if any). The constraints
     /// will be encoded in the DER form expected by the webpki crate's TrustAnchor representation.
-    fn mozilla_applied_constraints(&self) -> Option<Vec<u8>> {
+    pub fn mozilla_applied_constraints(&self) -> Option<Vec<u8>> {
         if self.mozilla_applied_constraints.is_empty() {
             return None;
         }
@@ -294,22 +189,15 @@ impl CertificateMetadata {
             date if date.is_empty() => None,
             date => Some(
                 NaiveDate::parse_from_str(date, "%Y.%m.%d")
-                    .unwrap_or_else(|_| panic!("invalid distrust for tls after date: {:?}", date)),
+                    .unwrap_or_else(|_| panic!("invalid distrust for tls after date: {date:?}")),
             ),
         }
     }
 
     /// Returns the DER encoding of the certificate contained in the metadata PEM. Panics if
     /// there is an error, or no certificate in the PEM content.
-    fn der(&self) -> Vec<u8> {
-        let certs = rustls_pemfile::certs(&mut self.pem().as_bytes()).expect("invalid PEM");
-        if certs.len() > 1 {
-            panic!("more than one certificate in metadata PEM");
-        }
-        certs
-            .first()
-            .expect("missing certificate in metadata PEM")
-            .clone()
+    pub fn der(&self) -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(self.pem().as_bytes()).expect("invalid PEM")
     }
 
     /// Returns the serial number for the certificate. Panics if the certificate serial number
@@ -330,12 +218,23 @@ impl CertificateMetadata {
     /// Returns the set of trust bits expressed for this certificate. Panics if the raw
     /// trust bits are invalid/unknown.
     fn trust_bits(&self) -> HashSet<TrustBits> {
-        self.trust_bits.split(';').map(TrustBits::from).collect()
+        let bits = self
+            .trust_bits
+            .split(';')
+            .map(TrustBits::from)
+            .collect::<HashSet<_>>();
+        if bits.contains(&TrustBits::AllTrustBitsTurnedOff) && bits.len() > 1 {
+            panic!(
+                "unexpected trust bits: AllTrustBitsTurnedOff \
+                   is mutually exclusive (found {bits:?})"
+            );
+        }
+        bits
     }
 
     /// Returns the PEM metadata for the certificate with the leading/trailing single quotes
     /// removed.
-    fn pem(&self) -> &str {
+    pub fn pem(&self) -> &str {
         self.pem_info.as_str().trim_matches('\'')
     }
 }
@@ -360,6 +259,10 @@ pub enum TrustBits {
     Websites,
     /// certificate is trusted for Email (e.g. S/MIME).
     Email,
+    /// certificate is trusted for code signing
+    Code,
+    /// certificate is not trusted for anything
+    AllTrustBitsTurnedOff,
 }
 
 impl From<&str> for TrustBits {
@@ -367,33 +270,70 @@ impl From<&str> for TrustBits {
         match value {
             "Websites" => TrustBits::Websites,
             "Email" => TrustBits::Email,
-            val => panic!("unknown trust bit: {:?}", val),
+            "Code" => TrustBits::Code,
+            "All Trust Bits Turned Off" => TrustBits::AllTrustBitsTurnedOff,
+            val => panic!("unknown trust bit: {val:?}"),
         }
     }
 }
 
-const HEADER: &str = r#"//!
-//! This library is automatically generated from the Mozilla 
-//! IncludedCACertificateReportPEMCSV report via ccadb.org. Don't edit it.
-//!
-//! The generation is done deterministically so you can verify it
-//! yourself by inspecting and re-running the generation process.
-//!
+static EXCLUDED_FINGERPRINTS: &[&str] = &[
+    // CN=GLOBALTRUST 2020 O=e-commerce monitoring GmbH
+    // This CA is being distrusted by the Mozilla root program for TLS certificates issued after 2024.06.30.
+    // but since it has <100 extant trusted certificates we exclude it from the generated root bundle
+    // immediately.
+    "9A296A5182D1D451A2E37F439B74DAAFA267523329F90F9A0D2007C334E23C9A",
+];
 
-#![forbid(unsafe_code, unstable_features)]
-#![deny(
-    trivial_casts,
-    trivial_numeric_casts,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A trust anchor (sometimes called a root) for validating X.509 certificates
-pub struct TrustAnchor<'a> {
-    pub subject: &'a [u8],
-    pub spki: &'a [u8],
-    pub name_constraints: Option<&'a [u8]>,
+    #[test]
+    fn test_trusted_for_tls() {
+        let mut metadata = CertificateMetadata {
+            common_name_or_certificate_name: "Test".to_string(),
+            certificate_serial_number: "1".to_string(),
+            sha256_fingerprint: "1".to_string(),
+            trust_bits: "Websites".to_string(),
+            distrust_for_tls_after_date: "".to_string(),
+            mozilla_applied_constraints: "".to_string(),
+            pem_info: "".to_string(),
+        };
+        // Trust bit set for Websites, no distrust date.
+        assert!(metadata.trusted_for_tls());
+
+        // Trust bit _not_ set for Websites.
+        metadata.trust_bits = "Email".to_string();
+        assert!(!metadata.trusted_for_tls());
+
+        // Trust bit set for Websites, no distrut date.
+        metadata.trust_bits = "Websites;Email".to_string();
+        assert!(metadata.trusted_for_tls());
+
+        // Trust bit set for Websites, distrust date far in the past.
+        metadata.trust_bits = "Websites".to_string();
+        metadata.distrust_for_tls_after_date = "2000.01.01".to_string();
+        assert!(!metadata.trusted_for_tls());
+
+        // Trust bit set for Websites, distrust date in the future.
+        let now = Utc::now().naive_utc();
+        let future_distrust = now.add(Duration::days(365 * 5));
+        metadata.distrust_for_tls_after_date = future_distrust.format("%Y.%m.%d").to_string();
+        assert!(metadata.trusted_for_tls());
+
+        // Trust bit set for Websites, distrust date has passed, but within grace period.
+        let past_distrust = now.add(Duration::days(-397));
+        metadata.distrust_for_tls_after_date = past_distrust.format("%Y.%m.%d").to_string();
+        assert!(metadata.trusted_for_tls());
+
+        // Trust bit set for Websites, distrust date has passed, outside grace period.
+        let past_distrust = now.add(Duration::days(-398));
+        metadata.distrust_for_tls_after_date = past_distrust.format("%Y.%m.%d").to_string();
+        assert!(!metadata.trusted_for_tls());
+
+        // Certificate FP is excluded.
+        metadata.sha256_fingerprint = EXCLUDED_FINGERPRINTS[0].to_string();
+        assert!(!metadata.trusted_for_tls());
+    }
 }
-
-"#;

@@ -2,26 +2,56 @@ name: webpki-roots
 
 on:
   push:
+    branches: ['main', 'ci/*']
   pull_request:
   schedule:
     - cron: '0 18 * * *'
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build+test
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: cargo build (debug; default features)
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test (debug; default features)
-        run: cargo test
+        run: cargo test --locked
+
+  semver:
+    name: Check semver compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  msrv:
+    name: Check MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.64.0
+      - run: cargo check --locked --lib -p webpki-roots
+      - run: cargo check --locked --lib -p webpki-root-certs

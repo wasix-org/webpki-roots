@@ -1,35 +1,36 @@
-[package]
-name = "webpki-roots"
-version = "0.25.2"
-edition = "2018"
-readme = "README.md"
-license = "MPL-2.0"
-description = "Mozilla's CA root certificates for use with webpki"
+[workspace]
+members = ["webpki-ccadb", "webpki-root-certs", "webpki-roots"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.64"
 homepage = "https://github.com/rustls/webpki-roots"
 repository = "https://github.com/rustls/webpki-roots"
 
-[dev-dependencies]
+[workspace.dependencies]
 chrono = { version = "0.4.26", default-features = false, features = ["clock"] }
 csv = "1.2.2"
 hex = "0.4.3"
 num-bigint = "0.4.3"
 percent-encoding = "2.3"
-rcgen = "0.11.1"
-reqwest = { git = "https://github.com/wasix-org/reqwest.git", version = "0.11", features = [
-    "rustls-tls-manual-roots",
-] }
-ring = "0.17.5"
-rustls-pemfile = "1"
+pki-types = { package = "rustls-pki-types", version = "1.8", default-features = false }
+rcgen = "0.14"
+reqwest = { version = "0.12.22", git = "https://github.com/wasix-org/reqwest.git", branch = "wasix-0.12.22", default-features = false, features = ["rustls-tls-manual-roots"] }
+ring = "0.17.0"
+rustls = { git = "https://github.com/wasix-org/rustls.git", branch = "wasix-0.23.31" }
 serde = { version = "1.0.183", features = ["derive"] }
-tokio = { version = "=1.24.2", git = "https://github.com/wasix-org/tokio.git", branch = "epoll", features = [
-    "macros",
-    "rt-multi-thread",
-] }
-webpki = { package = "rustls-webpki", version = "0.101.7" }
-x509-parser = "0.15.1"
+tokio = { version = "1", git = "https://github.com/wasix-org/tokio.git", branch = "wasix-1.47.0", features = ["macros", "rt-multi-thread"] }
+webpki = { package = "rustls-webpki", version = "0.103", features = ["alloc"] }
+x509-parser = "0.17.0"
 yasna = "0.5.2"
 
 
 [patch.crates-io]
-tokio = { git = "https://github.com/wasix-org/tokio.git", branch = "epoll" }
-reqwest = { git = "https://github.com/wasix-org/reqwest.git" }
+reqwest = { git = "https://github.com/wasix-org/reqwest.git", branch = "wasix-0.12.22" }
+socket2 = { git = "https://github.com/wasix-org/socket2.git", branch = "wasix-0.6.0" }
+tokio = { git = "https://github.com/wasix-org/tokio.git", branch = "wasix-1.47.0" }
+tower = { git = "https://github.com/wasix-org/tower.git", branch = "wasix-0.5.2" }
+tower-service = { git = "https://github.com/wasix-org/tower.git", branch = "wasix-0.5.2" }
+tower-layer = { git = "https://github.com/wasix-org/tower.git", branch = "wasix-0.5.2" }
+rustls = { git = "https://github.com/wasix-org/rustls.git", branch = "wasix-0.23.31" }
